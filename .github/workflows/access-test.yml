@@ -1,0 +1,39 @@
+name: GPN access test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  access-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: DNS lookup
+        shell: bash
+        run: |
+          echo "=== DNS ==="
+          getent ahosts gpnbonus.ru || true
+
+      - name: HTTPS access test
+        shell: bash
+        run: |
+          echo "=== HTTPS TEST ==="
+          set +e
+          curl -L -I -v \
+            --connect-timeout 10 \
+            --max-time 30 \
+            --user-agent 'Mozilla/5.0' \
+            'https://gpnbonus.ru/fuel/refuel-map' \
+            > /tmp/headers.txt 2> /tmp/curl.txt
+          CODE=$?
+          echo "curl exit code: $CODE"
+          echo "--- response headers ---"
+          cat /tmp/headers.txt || true
+          echo "--- curl diagnostics ---"
+          tail -n 100 /tmp/curl.txt || true
+          if [ "$CODE" -eq 0 ]; then
+            echo "RESULT: site is reachable from GitHub Actions"
+          else
+            echo "RESULT: site is NOT reachable from GitHub Actions"
+            exit "$CODE"
+          fi
