@@ -1,0 +1,75 @@
+name: Build and push to Yandex Container Registry
+
+permissions:
+  contents: read
+  id-token: write
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "Dockerfile"
+      - "requirements.txt"
+      - "app.py"
+      - ".github/workflows/build-and-push.yml"
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Get GitHub OIDC token
+        uses: actions/github-script@v7
+        id: oidc
+        with:
+          script: |
+            const core = require('@actions/core')
+            const token = await core.getIDToken()
+            core.setOutput('token', token)
+
+      - name: Exchange OIDC token for Yandex IAM token
+        id: iam
+        shell: bash
+        run: |
+          SA_ID="ajegu838eemcdhtrti60"
+
+          IAM_TOKEN=$(curl -s \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            -d "grant_type=urn:ietf:params:oauth:grant-type:token-exchange" \
+            -d "requested_token_type=urn:ietf:params:oauth:token-type:access_token" \
+            -d "audience=${SA_ID}" \
+            -d "subject_token=${{ steps.oidc.outputs.token }}" \
+            -d "subject_token_type=urn:ietf:params:oauth:token-type:id_token" \
+            https://auth.yandex.cloud/oauth/token | jq -r '.access_token')
+
+          if [ -z "$IAM_TOKEN" ] || [ "$IAM_TOKEN" = "null" ]; then
+            echo "Failed to get Yandex IAM token"
+            exit 1
+          fi
+
+          echo "::add-mask::$IAM_TOKEN"
+          echo "IAM_TOKEN=$IAM_TOKEN" >> "$GITHUB_ENV"
+
+      - name: Login to Yandex Container Registry
+        shell: bash
+        run: |
+          echo "$IAM_TOKEN" | docker login \
+            --username iam \
+            --password-stdin \
+            cr.yandex
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            -t cr.yandex/crp6qrgulv058lqii0m6/gpn-fuel-monitor:latest \
+            .
+
+      - name: Push Docker image
+        run: |
+          docker push \
+            cr.yandex/crp6qrgulv058lqii0m6/gpn-fuel-monitor:latest
