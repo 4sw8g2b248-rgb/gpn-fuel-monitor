@@ -22,7 +22,23 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
+      - name: Configure Docker upload
+        shell: bash
+        run: |
+          echo '{"max-concurrent-uploads":1}' | sudo tee /etc/docker/daemon.json
+          sudo systemctl restart docker
+
+      - name: Get GitHub OIDC token
+        id: oidc
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const token = await core.getIDToken()
+            core.setOutput('token', token)
       - name: Get GitHub OIDC token
         id: oidc
         uses: actions/github-script@v7
@@ -70,7 +86,16 @@ jobs:
             -t cr.yandex/crp6qrgulv058lqii0m6/gpn-fuel-monitor:latest \
             .
 
-      - name: Push Docker image
+          - name: Push Docker image
+        shell: bash
         run: |
-          docker push \
-            cr.yandex/crp6qrgulv058lqii0m6/gpn-fuel-monitor:latest
+          IMAGE="cr.yandex/crp6qrgulv058lqii0m6/gpn-fuel-monitor:latest"
+
+          for attempt in 1 2 3; do
+            echo "Push attempt $attempt"
+            timeout 900 docker push "$IMAGE" && exit 0
+            echo "Push attempt $attempt failed or timed out"
+            sleep 10
+          done
+
+          exit 1
