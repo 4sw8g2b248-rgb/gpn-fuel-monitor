@@ -68,20 +68,14 @@ def run_probe():
                     response.headers.get("content-type") or ""
                 ).lower()
 
-                if "json" in content_type or has_keyword(response.url):
-                    item = {
+            if "json" in content_type or has_keyword(response.url):
+                captured.append(
+                    {
                         "url": response.url,
                         "status": response.status,
                         "content_type": content_type,
                     }
-
-                    if "json" in content_type:
-                        try:
-                            item["sample"] = response.text()[:2000]
-                        except Exception:
-                            pass
-
-                    captured.append(item)
+                )
 
             except Exception:
                 pass
