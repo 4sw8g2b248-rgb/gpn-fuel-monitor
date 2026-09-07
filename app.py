@@ -62,11 +62,11 @@ def run_probe():
 
         page = context.new_page()
 
-        def handle_response(response):
-            try:
-                content_type = (
-                    response.headers.get("content-type") or ""
-                ).lower()
+    def handle_response(response):
+        try:
+            content_type = (
+                response.headers.get("content-type") or ""
+            ).lower()
 
             if "json" in content_type or has_keyword(response.url):
                 captured.append(
@@ -77,21 +77,21 @@ def run_probe():
                     }
                 )
 
-            except Exception:
-                pass
+        except Exception:
+            pass
 
-        page.on("response", handle_response)
+    page.on("response", handle_response)
 
-        navigation_error = None
+    navigation_error = None
 
-        try:
-            page.goto(
-                PAGE,
-                wait_until="domcontentloaded",
-                timeout=30000,
-            )
-        except Exception as e:
-            navigation_error = str(e)
+    try:
+        page.goto(
+            PAGE,
+            wait_until="domcontentloaded",
+            timeout=30000,
+        )
+    except Exception as e:
+        navigation_error = str(e)
 
         # Даём JavaScript карты время загрузить данные АЗС
         page.wait_for_timeout(10000)
