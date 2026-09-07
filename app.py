@@ -40,6 +40,9 @@ def has_keyword(text):
 def run_probe():
     started = time.time()
     captured = []
+    navigation_error = None
+    body_text = ""
+    title = ""
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -62,51 +65,50 @@ def run_probe():
 
         page = context.new_page()
 
-    def handle_response(response):
-        try:
-            content_type = (
-                response.headers.get("content-type") or ""
-            ).lower()
+        def handle_response(response):
+            try:
+                content_type = (
+                    response.headers.get("content-type") or ""
+                ).lower()
 
-            if "json" in content_type or has_keyword(response.url):
-                captured.append(
-                    {
-                        "url": response.url,
-                        "status": response.status,
-                        "content_type": content_type,
-                    }
+                if "json" in content_type or has_keyword(response.url):
+                    captured.append(
+                        {
+                            "url": response.url,
+                            "status": response.status,
+                            "content_type": content_type,
+                        }
+                    )
+            except Exception:
+                pass
+
+        page.on("response", handle_response)
+
+        try:
+            try:
+                page.goto(
+                    PAGE,
+                    wait_until="domcontentloaded",
+                    timeout=30000,
                 )
+            except Exception as e:
+                navigation_error = str(e)
 
-        except Exception:
-            pass
+            page.wait_for_timeout(10000)
 
-    page.on("response", handle_response)
+            try:
+                body_text = page.locator("body").inner_text(timeout=5000)
+            except Exception:
+                body_text = ""
 
-    navigation_error = None
+            try:
+                title = page.title()
+            except Exception:
+                title = ""
 
-    try:
-        page.goto(
-            PAGE,
-            wait_until="domcontentloaded",
-            timeout=30000,
-        )
-    except Exception as e:
-        navigation_error = str(e)
-
-        # Даём JavaScript карты время загрузить данные АЗС
-        page.wait_for_timeout(10000)
-
-        try:
-            body_text = page.locator("body").inner_text(timeout=5000)
-        except Exception:
-            body_text = ""
-
-        try:
-            title = page.title()
-        except Exception:
-            title = ""
-
-        browser.close()
+        finally:
+            page.remove_listener("response", handle_response)
+            browser.close()
 
     stations = []
 
@@ -134,7 +136,6 @@ def run_probe():
 
     status_found = STATUS.lower() in body_text.lower()
 
-    # Убираем повторяющиеся сетевые запросы
     unique_responses = []
     seen_urls = set()
 
@@ -150,11 +151,7 @@ def run_probe():
     relevant_responses = []
 
     for item in unique_responses:
-        combined = (
-            (item.get("url") or "")
-            + " "
-            + (item.get("sample") or "")
-        )
+        combined = item.get("url") or ""
 
         if (
             has_keyword(combined)
@@ -183,41 +180,3 @@ def run_probe():
         "relevant_responses": relevant_responses[:30],
         "body_sample": body_text[:1500],
     }
-
-
-@app.route("/")
-def home():
-    return jsonify(
-        {
-            "ok": True,
-            "service": "gpn-fuel-monitor",
-            "message": "Container is running",
-        }
-    )
-
-
-@app.route("/probe")
-def probe():
-    try:
-        return jsonify(run_probe())
-
-    except Exception as e:
-        return (
-            jsonify(
-                {
-                    "ok": False,
-                    "error": type(e).__name__,
-                    "message": str(e),
-                }
-            ),
-            500,
-        )
-
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "8080"))
-
-    app.run(
-        host="0.0.0.0",
-        port=port,
-    )
