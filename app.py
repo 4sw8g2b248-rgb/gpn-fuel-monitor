@@ -1,8 +1,10 @@
-
+import json
 import os
 import time
 import http.cookiejar
+import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 from flask import Flask, jsonify
@@ -22,6 +24,10 @@ TRACKED_FUELS = {
     "421": "G-95",
     "100032": "G-100",
 }
+
+REQUEST_TIMEOUT = 10
+MAX_ATTEMPTS = 3
+CHECK_DEADLINE_SECONDS = 75
 
 DEFAULT_HEADERS = {
     "User-Agent": (
@@ -43,46 +49,146 @@ def normalize_station_number(value):
 
 def make_opener():
     cookies = http.cookiejar.CookieJar()
-    return urllib.request.build_opener(
+
+    opener = urllib.request.build_opener(
         urllib.request.HTTPCookieProcessor(cookies)
     )
 
+    return opener
 
-def prime_session(opener):
-    req = urllib.request.Request(
-        PAGE,
-        headers={
-            **DEFAULT_HEADERS,
-            "Accept": (
-                "text/html,application/xhtml+xml,"
-                "application/xml;q=0.9,*/*;q=0.8"
-            ),
-        },
-        method="GET",
+
+def sleep_before_retry(attempt):
+    if attempt < MAX_ATTEMPTS:
+        time.sleep(min(1.5 * attempt, 3))
+
+
+def safe_error_text(error):
+    message = str(error)
+
+    if hasattr(error, "reason") and error.reason:
+        message = f"{message}; reason={error.reason}"
+
+    return message[:500]
+
+
+def prime_session(opener, deadline):
+    last_error = None
+
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                "Общий лимит времени проверки исчерпан "
+                "до установления сессии с GPN"
+            )
+
+        req = urllib.request.Request(
+            PAGE,
+            headers={
+                **DEFAULT_HEADERS,
+                "Accept": (
+                    "text/html,application/xhtml+xml,"
+                    "application/xml;q=0.9,*/*;q=0.8"
+                ),
+            },
+            method="GET",
+        )
+
+        try:
+            remaining = max(
+                1,
+                min(
+                    REQUEST_TIMEOUT,
+                    int(deadline - time.monotonic()),
+                ),
+            )
+
+            with opener.open(
+                req,
+                timeout=remaining,
+            ) as response:
+                response.read(200000)
+
+            return {
+                "ok": True,
+                "attempts": attempt,
+            }
+
+        except Exception as error:
+            last_error = error
+            sleep_before_retry(attempt)
+
+    raise RuntimeError(
+        "Не удалось открыть страницу GPN после "
+        f"{MAX_ATTEMPTS} попыток: "
+        f"{safe_error_text(last_error)}"
     )
 
-    with opener.open(req, timeout=30) as response:
-        response.read()
 
+def post_json(
+    opener,
+    url,
+    payload,
+    deadline,
+):
+    last_error = None
 
-def post_json(opener, url, payload=None):
-    body = json.dumps(payload or {}).encode("utf-8")
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                "Общий лимит времени проверки исчерпан"
+            )
 
-    req = urllib.request.Request(
-        url,
-        data=body,
-        headers={
-            **DEFAULT_HEADERS,
-            "Content-Type": "application/json",
-            "Referer": PAGE,
-            "Origin": BASE,
-        },
-        method="POST",
-    )
+        body = json.dumps(
+            payload or {}
+        ).encode("utf-8")
 
-    with opener.open(req, timeout=30) as response:
-        raw = response.read().decode("utf-8", errors="replace")
-        return json.loads(raw)
+        req = urllib.request.Request(
+            url,
+            data=body,
+            headers={
+                **DEFAULT_HEADERS,
+                "Content-Type": "application/json",
+                "Referer": PAGE,
+                "Origin": BASE,
+            },
+            method="POST",
+        )
+
+        try:
+            remaining = max(
+                1,
+                min(
+                    REQUEST_TIMEOUT,
+                    int(deadline - time.monotonic()),
+                ),
+            )
+
+            with opener.open(
+                req,
+                timeout=remaining,
+            ) as response:
+                raw = response.read().decode(
+                    "utf-8",
+                    errors="replace",
+                )
+
+            return {
+                "ok": True,
+                "attempts": attempt,
+                "data": json.loads(raw),
+            }
+
+        except Exception as error:
+            last_error = error
+            sleep_before_retry(attempt)
+
+    return {
+        "ok": False,
+        "attempts": MAX_ATTEMPTS,
+        "error": type(last_error).__name__,
+        "message": safe_error_text(last_error),
+        "data": None,
+    }
 
 
 def iter_fuel_records(node):
@@ -90,7 +196,10 @@ def iter_fuel_records(node):
         product = node.get("product")
         rest = node.get("rest")
 
-        if isinstance(product, dict) and isinstance(rest, dict):
+        if (
+            isinstance(product, dict)
+            and isinstance(rest, dict)
+        ):
             yield node
 
         for value in node.values():
@@ -102,21 +211,16 @@ def iter_fuel_records(node):
 
 
 def fuel_record_id(record):
+    product = record.get("product") or {}
+
     candidates = [
         record.get("id"),
         record.get("oilProductId"),
         record.get("oil_product_id"),
+        product.get("emisId"),
+        product.get("id"),
+        product.get("productId"),
     ]
-
-    product = record.get("product") or {}
-
-    candidates.extend(
-        [
-            product.get("emisId"),
-            product.get("id"),
-            product.get("productId"),
-        ]
-    )
 
     for value in candidates:
         if value is not None:
@@ -158,6 +262,7 @@ def build_fuel_status(record):
             "delivery_raw": None,
             "since": None,
             "price": None,
+            "currency": None,
         }
 
     rest = record.get("rest") or {}
@@ -165,7 +270,9 @@ def build_fuel_status(record):
 
     available = bool(rest.get("avail"))
     delivery_raw = rest.get("delivery")
-    in_transit = delivery_is_positive(delivery_raw)
+    in_transit = delivery_is_positive(
+        delivery_raw
+    )
 
     if available:
         status = "ЕСТЬ"
@@ -193,11 +300,19 @@ def find_target_stations(stations):
             station.get("PNPONumber")
         )
 
-        city = str(station.get("city") or "")
-        address = str(station.get("address") or "")
-        name = str(station.get("name") or "")
+        city = str(
+            station.get("city") or ""
+        )
+        address = str(
+            station.get("address") or ""
+        )
+        name = str(
+            station.get("name") or ""
+        )
 
-        haystack = f"{city} {address} {name}".lower()
+        haystack = (
+            f"{city} {address} {name}"
+        ).lower()
 
         if (
             number in TARGET_NUMBERS
@@ -208,7 +323,26 @@ def find_target_stations(stations):
     return result
 
 
-def check_station(opener, station):
+def blank_fuels(status):
+    return {
+        fuel_name: {
+            "status": status,
+            "available": False,
+            "in_transit": False,
+            "delivery_raw": None,
+            "since": None,
+            "price": None,
+            "currency": None,
+        }
+        for fuel_name in TRACKED_FUELS.values()
+    }
+
+
+def check_station(
+    opener,
+    station,
+    deadline,
+):
     number = normalize_station_number(
         station.get("PNPONumber")
     )
@@ -226,94 +360,223 @@ def check_station(opener, station):
     }
 
     if not gpnazsid:
-        result["error"] = "У АЗС отсутствует GPNAZSID"
+        result["error"] = (
+            "У АЗС отсутствует GPNAZSID"
+        )
+        result["fuels"] = blank_fuels(
+            "ОШИБКА"
+        )
         return result
 
-    try:
-        detail = post_json(
-            opener,
-            f"{BASE}/api/stations/{gpnazsid}",
-            {},
-        )
+    response = post_json(
+        opener,
+        f"{BASE}/api/stations/{gpnazsid}",
+        {},
+        deadline,
+    )
 
-        records = {}
+    result["api_attempts"] = response[
+        "attempts"
+    ]
 
-        for record in iter_fuel_records(detail):
-            rid = fuel_record_id(record)
-
-            if rid and rid not in records:
-                records[rid] = record
-
-        for fuel_id, fuel_name in TRACKED_FUELS.items():
-            result["fuels"][fuel_name] = build_fuel_status(
-                records.get(fuel_id)
-            )
-
-    except Exception as error:
+    if not response["ok"]:
         result["error"] = (
-            f"{type(error).__name__}: {error}"
+            f'{response["error"]}: '
+            f'{response["message"]}'
+        )
+        result["fuels"] = blank_fuels(
+            "ОШИБКА"
+        )
+        return result
+
+    detail = response["data"]
+
+    records = {}
+
+    for record in iter_fuel_records(
+        detail
+    ):
+        record_id = fuel_record_id(
+            record
         )
 
-        for fuel_name in TRACKED_FUELS.values():
-            result["fuels"][fuel_name] = {
-                "status": "ОШИБКА",
-                "available": False,
-                "in_transit": False,
-                "delivery_raw": None,
-                "since": None,
-                "price": None,
-            }
+        if (
+            record_id
+            and record_id not in records
+        ):
+            records[record_id] = record
+
+    for fuel_id, fuel_name in (
+        TRACKED_FUELS.items()
+    ):
+        result["fuels"][
+            fuel_name
+        ] = build_fuel_status(
+            records.get(fuel_id)
+        )
 
     return result
 
 
 def run_check():
-    started = time.time()
+    started = time.monotonic()
+
+    deadline = (
+        started + CHECK_DEADLINE_SECONDS
+    )
 
     opener = make_opener()
-    prime_session(opener)
 
-    stations_data = post_json(
+    prime_info = prime_session(
+        opener,
+        deadline,
+    )
+
+    station_list_response = post_json(
         opener,
         STATIONS_API,
         {},
+        deadline,
     )
 
-    all_stations = stations_data.get("stations", [])
-    targets = find_target_stations(all_stations)
+    if not station_list_response["ok"]:
+        return {
+            "ok": False,
+            "stage": "stations_list",
+            "error": station_list_response[
+                "error"
+            ],
+            "message": station_list_response[
+                "message"
+            ],
+            "attempts": station_list_response[
+                "attempts"
+            ],
+            "elapsed_seconds": round(
+                time.monotonic() - started,
+                2,
+            ),
+        }
 
-    checked = [
-        check_station(opener, station)
-        for station in targets
+    stations_data = station_list_response[
+        "data"
     ]
 
-    checked.sort(key=lambda x: x["number"])
+    all_stations = stations_data.get(
+        "stations",
+        [],
+    )
+
+    targets = find_target_stations(
+        all_stations
+    )
+
+    checked = []
+
+    with ThreadPoolExecutor(
+        max_workers=4
+    ) as executor:
+        future_map = {
+            executor.submit(
+                check_station,
+                opener,
+                station,
+                deadline,
+            ): station
+            for station in targets
+        }
+
+        for future in as_completed(
+            future_map
+        ):
+            try:
+                checked.append(
+                    future.result()
+                )
+
+            except Exception as error:
+                station = future_map[
+                    future
+                ]
+
+                number = normalize_station_number(
+                    station.get(
+                        "PNPONumber"
+                    )
+                )
+
+                checked.append(
+                    {
+                        "number": number.zfill(
+                            3
+                        ),
+                        "gpnazsid": station.get(
+                            "GPNAZSID"
+                        ),
+                        "name": station.get(
+                            "name"
+                        ),
+                        "city": station.get(
+                            "city"
+                        ),
+                        "address": station.get(
+                            "address"
+                        ),
+                        "open": station.get(
+                            "open"
+                        ),
+                        "error": (
+                            f"{type(error).__name__}: "
+                            f"{error}"
+                        ),
+                        "fuels": blank_fuels(
+                            "ОШИБКА"
+                        ),
+                    }
+                )
+
+    checked.sort(
+        key=lambda item: item["number"]
+    )
 
     alerts = []
 
     for station in checked:
-        for fuel_name, fuel in station["fuels"].items():
-            if fuel.get("status") == "В ПУТИ":
+        for fuel_name, fuel in (
+            station["fuels"].items()
+        ):
+            if (
+                fuel.get("status")
+                == "В ПУТИ"
+            ):
                 alerts.append(
                     {
-                        "station": station["number"],
-                        "address": station.get("address"),
+                        "station": station[
+                            "number"
+                        ],
+                        "address": station.get(
+                            "address"
+                        ),
                         "fuel": fuel_name,
                         "status": "В ПУТИ",
                         "delivery_raw": fuel.get(
                             "delivery_raw"
                         ),
-                        "since": fuel.get("since"),
+                        "since": fuel.get(
+                            "since"
+                        ),
                     }
                 )
 
     found_numbers = {
-        item["number"].lstrip("0") or "0"
+        item["number"].lstrip("0")
+        or "0"
         for item in checked
     }
 
     missing = sorted(
-        TARGET_NUMBERS - found_numbers,
+        TARGET_NUMBERS
+        - found_numbers,
         key=lambda x: int(x),
     )
 
@@ -323,11 +586,27 @@ def run_check():
             timezone.utc
         ).isoformat(),
         "elapsed_seconds": round(
-            time.time() - started,
+            time.monotonic() - started,
             2,
         ),
-        "total_stations_received": len(all_stations),
-        "target_stations_found": len(checked),
+        "request_timeout_seconds": (
+            REQUEST_TIMEOUT
+        ),
+        "max_attempts": MAX_ATTEMPTS,
+        "session_attempts": (
+            prime_info["attempts"]
+        ),
+        "stations_list_attempts": (
+            station_list_response[
+                "attempts"
+            ]
+        ),
+        "total_stations_received": len(
+            all_stations
+        ),
+        "target_stations_found": len(
+            checked
+        ),
         "missing_target_numbers": [
             number.zfill(3)
             for number in missing
@@ -343,7 +622,7 @@ def home():
         {
             "ok": True,
             "service": "gpn-fuel-monitor",
-            "mode": "direct-gpn-api",
+            "mode": "direct-gpn-api-retry",
             "tracked_stations": [
                 "062",
                 "065",
@@ -352,6 +631,12 @@ def home():
             ],
             "tracked_fuels": list(
                 TRACKED_FUELS.values()
+            ),
+            "request_timeout_seconds": (
+                REQUEST_TIMEOUT
+            ),
+            "max_attempts": (
+                MAX_ATTEMPTS
             ),
             "endpoints": [
                 "/check",
@@ -364,15 +649,21 @@ def home():
 @app.route("/check")
 def check():
     try:
-        return jsonify(run_check())
+        return jsonify(
+            run_check()
+        )
 
     except Exception as error:
         return (
             jsonify(
                 {
                     "ok": False,
-                    "error": type(error).__name__,
-                    "message": str(error),
+                    "error": type(
+                        error
+                    ).__name__,
+                    "message": str(
+                        error
+                    ),
                 }
             ),
             500,
