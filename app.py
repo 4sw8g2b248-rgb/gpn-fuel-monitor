@@ -1,8 +1,12 @@
+import html
 import os
+import re
 import time
+from urllib.error import HTTPError, URLError
+from urllib.parse import urljoin
+from urllib.request import Request, urlopen
 
 from flask import Flask, jsonify
-from playwright.sync_api import sync_playwright
 
 
 app = Flask(__name__)
@@ -16,7 +20,12 @@ TARGETS = [
     {"number": "111", "address": "Суворова, 12"},
 ]
 
-FUELS = ["АИ-95", "G-95", "G-100"]
+FUELS = [
+    "АИ-95",
+    "G-95",
+    "G-100",
+]
+
 STATUS = "В пути"
 
 KEYWORDS = [
@@ -34,167 +43,238 @@ KEYWORDS = [
 ]
 
 
-def has_keyword(text):
-    text = (text or "").lower()
-    return any(word in text for word in KEYWORDS)
+def contains_keyword(text):
+    value = (text or "").lower()
+    return any(keyword in value for keyword in KEYWORDS)
+
+
+def clean_text(value):
+    value = html.unescape(value or "")
+    value = re.sub(r"\s+", " ", value)
+    return value.strip()
+
+
+def fetch_page():
+    print("HTTP PROBE 1: starting request", flush=True)
+
+    request = Request(
+        PAGE,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/152.0 Safari/537.36"
+            ),
+            "Accept": (
+                "text/html,application/xhtml+xml,"
+                "application/xml;q=0.9,image/avif,"
+                "image/webp,*/*;q=0.8"
+            ),
+            "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+        },
+        method="GET",
+    )
+
+    try:
+        with urlopen(request, timeout=30) as response:
+            print("HTTP PROBE 2: response received", flush=True)
+
+            raw = response.read()
+
+            print(
+                f"HTTP PROBE 3: downloaded {len(raw)} bytes",
+                flush=True,
+            )
+
+            charset = response.headers.get_content_charset()
+
+            if not charset:
+                charset = "utf-8"
+
+            text = raw.decode(
+                charset,
+                errors="replace",
+            )
+
+            return {
+                "ok": True,
+                "status": response.status,
+                "final_url": response.geturl(),
+                "content_type": response.headers.get(
+                    "Content-Type",
+                    "",
+                ),
+                "text": text,
+            }
+
+    except HTTPError as error:
+        try:
+            body = error.read().decode(
+                "utf-8",
+                errors="replace",
+            )
+        except Exception:
+            body = ""
+
+        return {
+            "ok": False,
+            "status": error.code,
+            "error": "HTTPError",
+            "message": str(error),
+            "text": body,
+        }
+
+    except URLError as error:
+        return {
+            "ok": False,
+            "status": None,
+            "error": "URLError",
+            "message": str(error),
+            "text": "",
+        }
+
+    except Exception as error:
+        return {
+            "ok": False,
+            "status": None,
+            "error": type(error).__name__,
+            "message": str(error),
+            "text": "",
+        }
+
+
+def extract_title(page_text):
+    match = re.search(
+        r"<title[^>]*>(.*?)</title>",
+        page_text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    if not match:
+        return ""
+
+    return clean_text(match.group(1))
+
+
+def extract_scripts(page_text):
+    scripts = []
+
+    pattern = re.compile(
+        r"""<script[^>]+src=["']([^"']+)["']""",
+        flags=re.IGNORECASE,
+    )
+
+    for src in pattern.findall(page_text):
+        full_url = urljoin(PAGE, html.unescape(src))
+
+        if full_url not in scripts:
+            scripts.append(full_url)
+
+    return scripts
+
+
+def extract_urls(page_text):
+    found = []
+
+    absolute_pattern = re.compile(
+        r"""https?://[^\s"'<>\\]+""",
+        flags=re.IGNORECASE,
+    )
+
+    for url in absolute_pattern.findall(page_text):
+        url = html.unescape(url)
+
+        if contains_keyword(url):
+            if url not in found:
+                found.append(url)
+
+    path_pattern = re.compile(
+        r"""["']([^"']*(?:api|graphql|fuel|refuel|"""
+        r"""station|azs|availability|status)[^"']*)["']""",
+        flags=re.IGNORECASE,
+    )
+
+    for value in path_pattern.findall(page_text):
+        value = html.unescape(value)
+
+        if len(value) > 300:
+            continue
+
+        if value.startswith("/"):
+            value = urljoin(PAGE, value)
+
+        if value not in found:
+            found.append(value)
+
+    return found
+
+
+def find_keyword_snippets(page_text):
+    snippets = []
+
+    lowered = page_text.lower()
+
+    search_values = (
+        [target["address"] for target in TARGETS]
+        + [target["number"] for target in TARGETS]
+        + FUELS
+        + [STATUS]
+    )
+
+    for value in search_values:
+        pos = lowered.find(value.lower())
+
+        if pos == -1:
+            continue
+
+        start = max(0, pos - 200)
+        end = min(len(page_text), pos + 500)
+
+        snippet = clean_text(
+            page_text[start:end]
+        )
+
+        snippets.append(
+            {
+                "search": value,
+                "snippet": snippet,
+            }
+        )
+
+    return snippets[:20]
 
 
 def run_probe():
-    print("PROBE 1: started", flush=True)
-
     started = time.time()
-    captured = []
-    navigation_error = None
-    body_text = ""
-    title = ""
 
-    print("PROBE 2: before sync_playwright", flush=True)
+    result = fetch_page()
 
-    with sync_playwright() as p:
-        print("PROBE 3: playwright started", flush=True)
+    page_text = result.get("text", "")
 
-        browser = p.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-            ],
-        )
+    if not result.get("ok"):
+        return {
+            "ok": False,
+            "elapsed_seconds": round(
+                time.time() - started,
+                2,
+            ),
+            "http_status": result.get("status"),
+            "error": result.get("error"),
+            "message": result.get("message"),
+            "body_sample": page_text[:1500],
+        }
 
-        print("PROBE 4: browser launched", flush=True)
+    print("HTTP PROBE 4: analysing HTML", flush=True)
 
-        context = browser.new_context(
-            locale="ru-RU",
-            timezone_id="Asia/Yekaterinburg",
-            geolocation={
-                "latitude": 56.4145,
-                "longitude": 61.9180,
-            },
-            permissions=["geolocation"],
-        )
-
-        print("PROBE 5: context created", flush=True)
-
-        page = context.new_page()
-
-        print("PROBE 6: page created", flush=True)
-
-        def handle_response(response):
-            try:
-                content_type = (
-                    response.headers.get("content-type") or ""
-                ).lower()
-
-                if "json" in content_type or has_keyword(response.url):
-                    captured.append(
-                        {
-                            "url": response.url,
-                            "status": response.status,
-                            "content_type": content_type,
-                        }
-                    )
-            except Exception:
-                pass
-
-        page.on("response", handle_response)
-
-        try:
-            print("PROBE 7: before goto", flush=True)
-
-            try:
-                page.goto(
-                    PAGE,
-                    wait_until="domcontentloaded",
-                    timeout=30000,
-                )
-
-                print("PROBE 8: goto finished", flush=True)
-
-            except Exception as e:
-                navigation_error = str(e)
-
-                print(
-                    f"PROBE 8A: goto error: {type(e).__name__}: {e}",
-                    flush=True,
-                )
-
-            print("PROBE 9: before wait", flush=True)
-
-            page.wait_for_timeout(10000)
-
-            print("PROBE 10: wait finished", flush=True)
-
-            try:
-                print("PROBE 11: before body text", flush=True)
-
-                body_text = page.locator("body").inner_text(
-                    timeout=5000
-                )
-
-                print("PROBE 12: body text received", flush=True)
-
-            except Exception as e:
-                body_text = ""
-
-                print(
-                    f"PROBE 12A: body error: "
-                    f"{type(e).__name__}: {e}",
-                    flush=True,
-                )
-
-            try:
-                print("PROBE 13: before title", flush=True)
-
-                title = page.title()
-
-                print("PROBE 14: title received", flush=True)
-
-            except Exception as e:
-                title = ""
-
-                print(
-                    f"PROBE 14A: title error: "
-                    f"{type(e).__name__}: {e}",
-                    flush=True,
-                )
-
-        finally:
-            print(
-                "PROBE 15: before remove listener",
-                flush=True,
-            )
-
-            try:
-                page.remove_listener(
-                    "response",
-                    handle_response,
-                )
-
-            except Exception as e:
-                print(
-                    f"PROBE 15A: listener error: "
-                    f"{type(e).__name__}: {e}",
-                    flush=True,
-                )
-
-            print(
-                "PROBE 16: before browser close",
-                flush=True,
-            )
-
-            browser.close()
-
-            print(
-                "PROBE 17: browser closed",
-                flush=True,
-            )
-
-    print(
-        "PROBE 18: playwright block finished",
-        flush=True,
-    )
+    title = extract_title(page_text)
+    scripts = extract_scripts(page_text)
+    candidate_urls = extract_urls(page_text)
 
     stations = []
+
+    lowered = page_text.lower()
 
     for station in TARGETS:
         number = station["number"]
@@ -206,63 +286,29 @@ def run_probe():
                 "number": number,
                 "address": address,
                 "number_found": (
-                    number in body_text
-                    or number_without_zero in body_text
+                    number.lower() in lowered
+                    or (
+                        number_without_zero
+                        and number_without_zero.lower()
+                        in lowered
+                    )
                 ),
                 "address_found": (
-                    address.lower()
-                    in body_text.lower()
+                    address.lower() in lowered
                 ),
             }
         )
 
     fuels = {
-        fuel: fuel.lower() in body_text.lower()
+        fuel: fuel.lower() in lowered
         for fuel in FUELS
     }
 
-    status_found = (
-        STATUS.lower() in body_text.lower()
-    )
+    status_found = STATUS.lower() in lowered
 
-    unique_responses = []
-    seen_urls = set()
+    snippets = find_keyword_snippets(page_text)
 
-    for item in captured:
-        url = item.get("url")
-
-        if url in seen_urls:
-            continue
-
-        seen_urls.add(url)
-        unique_responses.append(item)
-
-    relevant_responses = []
-
-    for item in unique_responses:
-        combined = item.get("url") or ""
-
-        if (
-            has_keyword(combined)
-            or any(
-                target["address"].lower()
-                in combined.lower()
-                for target in TARGETS
-            )
-            or any(
-                fuel.lower()
-                in combined.lower()
-                for fuel in FUELS
-            )
-            or STATUS.lower()
-            in combined.lower()
-        ):
-            relevant_responses.append(item)
-
-    print(
-        "PROBE 19: completed successfully",
-        flush=True,
-    )
+    print("HTTP PROBE 5: completed", flush=True)
 
     return {
         "ok": True,
@@ -270,19 +316,25 @@ def run_probe():
             time.time() - started,
             2,
         ),
+        "http_status": result.get("status"),
+        "final_url": result.get("final_url"),
+        "content_type": result.get(
+            "content_type",
+            "",
+        ),
         "page_title": title,
-        "navigation_error": navigation_error,
-        "body_text_size": len(body_text),
+        "html_size": len(page_text),
         "stations": stations,
         "fuels": fuels,
         "status_in_transit_found": status_found,
-        "captured_response_count": len(
-            unique_responses
+        "script_count": len(scripts),
+        "scripts": scripts[:30],
+        "candidate_url_count": len(candidate_urls),
+        "candidate_urls": candidate_urls[:50],
+        "keyword_snippets": snippets,
+        "body_sample": clean_text(
+            page_text[:2000]
         ),
-        "relevant_responses": (
-            relevant_responses[:30]
-        ),
-        "body_sample": body_text[:1500],
     }
 
 
@@ -293,6 +345,7 @@ def home():
             "ok": True,
             "service": "gpn-fuel-monitor",
             "message": "Container is running",
+            "mode": "direct-http",
         }
     )
 
@@ -302,13 +355,13 @@ def probe():
     try:
         return jsonify(run_probe())
 
-    except Exception as e:
+    except Exception as error:
         return (
             jsonify(
                 {
                     "ok": False,
-                    "error": type(e).__name__,
-                    "message": str(e),
+                    "error": type(error).__name__,
+                    "message": str(error),
                 }
             ),
             500,
@@ -317,7 +370,10 @@ def probe():
 
 if __name__ == "__main__":
     port = int(
-        os.environ.get("PORT", "8080")
+        os.environ.get(
+            "PORT",
+            "8080",
+        )
     )
 
     app.run(
