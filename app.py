@@ -1,11 +1,13 @@
-import json
+
 import os
 import time
 import http.cookiejar
 import urllib.error
 import urllib.request
+import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 from flask import Flask, jsonify, request
 
@@ -28,6 +30,11 @@ TRACKED_FUELS = {
 REQUEST_TIMEOUT = 10
 MAX_ATTEMPTS = 3
 CHECK_DEADLINE_SECONDS = 75
+
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+TELEGRAM_STATE_FILE = "/tmp/gpn_telegram_state.json"
+LOCAL_TZ = ZoneInfo("Asia/Yekaterinburg")
 
 DEFAULT_HEADERS = {
     "User-Agent": (
@@ -616,11 +623,206 @@ def run_check():
     }
 
 
+
+def telegram_is_configured():
+    return bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
+
+
+def telegram_send_message(message):
+    if not telegram_is_configured():
+        return {
+            "ok": False,
+            "skipped": True,
+            "reason": "Telegram не настроен",
+        }
+
+    url = (
+        "https://api.telegram.org/bot"
+        + TELEGRAM_BOT_TOKEN
+        + "/sendMessage"
+    )
+
+    payload = urllib.parse.urlencode(
+        {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": message,
+            "disable_web_page_preview": "true",
+        }
+    ).encode("utf-8")
+
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": "gpn-fuel-monitor/1.0",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=10) as response:
+            raw = response.read().decode("utf-8", errors="replace")
+            data = json.loads(raw)
+
+        return {
+            "ok": bool(data.get("ok")),
+            "telegram_response": data,
+        }
+
+    except Exception as error:
+        return {
+            "ok": False,
+            "error": type(error).__name__,
+            "message": str(error)[:500],
+        }
+
+
+def load_telegram_state():
+    try:
+        with open(TELEGRAM_STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+
+    return {"sent": {}}
+
+
+def save_telegram_state(state):
+    try:
+        with open(TELEGRAM_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(
+                state,
+                f,
+                ensure_ascii=False,
+                indent=2,
+            )
+    except Exception:
+        pass
+
+
+def alert_fingerprint(alert):
+    return "|".join(
+        [
+            str(alert.get("station") or ""),
+            str(alert.get("fuel") or ""),
+            str(alert.get("since") or ""),
+            str(alert.get("delivery_raw") or ""),
+        ]
+    )
+
+
+def format_alert_message(alert):
+    station = alert.get("station") or "?"
+    address = alert.get("address") or "адрес не указан"
+    fuel = alert.get("fuel") or "топливо"
+    since = alert.get("since")
+
+    lines = [
+        "⛽ Топливо в пути",
+        f"АЗС №{station} — {address}",
+        f"{fuel} — В ПУТИ",
+    ]
+
+    if since:
+        lines.append(f"Статус с: {since}")
+
+    lines.append(
+        "Проверено: "
+        + datetime.now(LOCAL_TZ).strftime("%d.%m.%Y %H:%M")
+    )
+
+    return "\n".join(lines)
+
+
+def send_new_alerts(check_result):
+    alerts = check_result.get("alerts") or []
+
+    if not telegram_is_configured():
+        return {
+            "configured": False,
+            "sent_count": 0,
+            "results": [],
+        }
+
+    state = load_telegram_state()
+    sent = state.get("sent") or {}
+
+    active_fingerprints = set()
+    results = []
+
+    for alert in alerts:
+        fingerprint = alert_fingerprint(alert)
+        active_fingerprints.add(fingerprint)
+
+        if fingerprint in sent:
+            results.append(
+                {
+                    "fingerprint": fingerprint,
+                    "sent": False,
+                    "reason": "already_sent",
+                }
+            )
+            continue
+
+        response = telegram_send_message(
+            format_alert_message(alert)
+        )
+
+        if response.get("ok"):
+            sent[fingerprint] = {
+                "sent_at": datetime.now(
+                    timezone.utc
+                ).isoformat(),
+                "alert": alert,
+            }
+
+        results.append(
+            {
+                "fingerprint": fingerprint,
+                "sent": bool(response.get("ok")),
+                "response": response,
+            }
+        )
+
+    sent = {
+        key: value
+        for key, value in sent.items()
+        if key in active_fingerprints
+    }
+
+    save_telegram_state({"sent": sent})
+
+    return {
+        "configured": True,
+        "sent_count": sum(
+            1 for item in results if item.get("sent")
+        ),
+        "results": results,
+        "note": (
+            "Антидубликаты хранятся локально в /tmp. "
+            "После холодного перезапуска контейнера возможен повтор одного уведомления."
+        ),
+    }
+
+
+def run_check_and_notify():
+    result = run_check()
+
+    if result.get("ok"):
+        result["telegram"] = send_new_alerts(result)
+
+    return result
+
+
 @app.route("/", methods=["GET", "POST"])
 def home():
     if request.method == "POST":
         try:
-            return jsonify(run_check())
+            return jsonify(run_check_and_notify())
         except Exception as error:
             return (
                 jsonify(
@@ -659,6 +861,43 @@ def home():
                 "/probe",
             ],
             "timer_ready": True,
+            "telegram_configured": telegram_is_configured(),
+        }
+    )
+
+
+
+@app.route("/telegram-test")
+def telegram_test():
+    if not telegram_is_configured():
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "message": (
+                        "Telegram не настроен. "
+                        "Нужны TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID."
+                    ),
+                }
+            ),
+            400,
+        )
+
+    message = (
+        "✅ Тест GPN Fuel Monitor\n"
+        "Telegram-уведомления подключены.\n"
+        "АЗС: 062, 065, 066, 111\n"
+        "Топливо: АИ-95, G-95, G-100\n"
+        "Время: "
+        + datetime.now(LOCAL_TZ).strftime("%d.%m.%Y %H:%M")
+    )
+
+    response = telegram_send_message(message)
+
+    return jsonify(
+        {
+            "ok": bool(response.get("ok")),
+            "telegram": response,
         }
     )
 
