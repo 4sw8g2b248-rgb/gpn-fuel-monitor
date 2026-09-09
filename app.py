@@ -7,7 +7,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 
 
 app = Flask(__name__)
@@ -616,8 +616,23 @@ def run_check():
     }
 
 
-@app.route("/")
+@app.route("/", methods=["GET", "POST"])
 def home():
+    if request.method == "POST":
+        try:
+            return jsonify(run_check())
+        except Exception as error:
+            return (
+                jsonify(
+                    {
+                        "ok": False,
+                        "error": type(error).__name__,
+                        "message": str(error),
+                    }
+                ),
+                500,
+            )
+
     return jsonify(
         {
             "ok": True,
@@ -639,9 +654,11 @@ def home():
                 MAX_ATTEMPTS
             ),
             "endpoints": [
+                "/",
                 "/check",
                 "/probe",
             ],
+            "timer_ready": True,
         }
     )
 
