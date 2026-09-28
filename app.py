@@ -36,6 +36,7 @@ MAX_API_BASE = "https://platform-api2.max.ru"
 MAX_BOT_TOKEN = os.environ.get("MAX_BOT_TOKEN", "").strip()
 MAX_CHAT_ID = os.environ.get("MAX_CHAT_ID", "").strip()
 MAX_STATE_FILE = "/tmp/gpn_max_state.json"
+MAX_WEBHOOK_STATE_FILE = "/tmp/gpn_max_webhook_event.json"
 
 LOCAL_TZ = ZoneInfo("Asia/Yekaterinburg")
 
@@ -831,6 +832,196 @@ def max_get_updates():
             "message": str(error)[:500],
         }
 
+
+def max_get_subscriptions():
+    if not MAX_BOT_TOKEN:
+        return {
+            "ok": False,
+            "reason": "MAX_BOT_TOKEN не задан",
+        }
+
+    url = MAX_API_BASE + "/subscriptions"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": MAX_BOT_TOKEN,
+            "Accept": "application/json",
+            "User-Agent": "gpn-fuel-monitor/2.2",
+        },
+        method="GET",
+    )
+
+    try:
+        with urllib.request.urlopen(
+            req,
+            timeout=15,
+            context=max_ssl_context(),
+        ) as response:
+            raw = response.read().decode(
+                "utf-8",
+                errors="replace",
+            )
+            status_code = getattr(
+                response,
+                "status",
+                200,
+            )
+
+        try:
+            data = json.loads(raw)
+        except Exception:
+            data = {"raw": raw[:2000]}
+
+        return {
+            "ok": 200 <= status_code < 300,
+            "status_code": status_code,
+            "data": data,
+        }
+
+    except urllib.error.HTTPError as error:
+        try:
+            raw = error.read().decode(
+                "utf-8",
+                errors="replace",
+            )
+        except Exception:
+            raw = ""
+
+        return {
+            "ok": False,
+            "error": "HTTPError",
+            "status_code": error.code,
+            "message": str(error)[:500],
+            "response_body": raw[:2000],
+        }
+
+    except Exception as error:
+        return {
+            "ok": False,
+            "error": type(error).__name__,
+            "message": str(error)[:500],
+        }
+
+
+def max_create_subscription(webhook_url):
+    if not MAX_BOT_TOKEN:
+        return {
+            "ok": False,
+            "reason": "MAX_BOT_TOKEN не задан",
+        }
+
+    url = MAX_API_BASE + "/subscriptions"
+    body = json.dumps(
+        {
+            "url": webhook_url,
+            "update_types": [
+                "bot_added",
+                "bot_admin_permissions_changed",
+                "bot_removed",
+            ],
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={
+            "Authorization": MAX_BOT_TOKEN,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "gpn-fuel-monitor/2.2",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(
+            req,
+            timeout=15,
+            context=max_ssl_context(),
+        ) as response:
+            raw = response.read().decode(
+                "utf-8",
+                errors="replace",
+            )
+            status_code = getattr(
+                response,
+                "status",
+                200,
+            )
+
+        try:
+            data = json.loads(raw)
+        except Exception:
+            data = {"raw": raw[:2000]}
+
+        return {
+            "ok": 200 <= status_code < 300,
+            "status_code": status_code,
+            "webhook_url": webhook_url,
+            "data": data,
+        }
+
+    except urllib.error.HTTPError as error:
+        try:
+            raw = error.read().decode(
+                "utf-8",
+                errors="replace",
+            )
+        except Exception:
+            raw = ""
+
+        return {
+            "ok": False,
+            "error": "HTTPError",
+            "status_code": error.code,
+            "message": str(error)[:500],
+            "response_body": raw[:2000],
+            "webhook_url": webhook_url,
+        }
+
+    except Exception as error:
+        return {
+            "ok": False,
+            "error": type(error).__name__,
+            "message": str(error)[:500],
+            "webhook_url": webhook_url,
+        }
+
+
+def save_max_webhook_event(event):
+    try:
+        with open(
+            MAX_WEBHOOK_STATE_FILE,
+            "w",
+            encoding="utf-8",
+        ) as f:
+            json.dump(
+                event,
+                f,
+                ensure_ascii=False,
+                indent=2,
+            )
+        return True
+    except Exception:
+        return False
+
+
+def load_max_webhook_event():
+    try:
+        with open(
+            MAX_WEBHOOK_STATE_FILE,
+            "r",
+            encoding="utf-8",
+        ) as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+    return {}
+
 def load_max_state():
     try:
         with open(
@@ -1093,6 +1284,10 @@ def home():
                 "/check",
                 "/probe",
                 "/max-test",
+                "/max-updates",
+                "/max-subscriptions",
+                "/max-subscribe",
+                "/max-webhook-last",
             ],
             "timer_ready": True,
             "max_configured": (
@@ -1149,6 +1344,75 @@ def max_test():
 @app.route("/max-updates")
 def max_updates():
     return jsonify(max_get_updates())
+
+
+@app.route("/max-subscriptions")
+def max_subscriptions():
+    return jsonify(max_get_subscriptions())
+
+
+@app.route("/max-subscribe")
+def max_subscribe():
+    webhook_url = (
+        request.url_root.rstrip("/")
+        + "/max-webhook"
+    )
+    return jsonify(
+        max_create_subscription(webhook_url)
+    )
+
+
+@app.route("/max-webhook", methods=["POST"])
+def max_webhook():
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        payload = {
+            "raw": request.get_data(
+                cache=False,
+                as_text=True,
+            )[:4000]
+        }
+
+    safe_event = {
+        "received_at": datetime.now(
+            timezone.utc
+        ).isoformat(),
+        "update_type": payload.get(
+            "update_type"
+        ),
+        "timestamp": payload.get(
+            "timestamp"
+        ),
+        "chat_id": payload.get(
+            "chat_id"
+        ),
+        "is_channel": payload.get(
+            "is_channel"
+        ),
+        "payload": payload,
+    }
+
+    saved = save_max_webhook_event(
+        safe_event
+    )
+
+    return jsonify(
+        {
+            "ok": True,
+            "saved": saved,
+        }
+    )
+
+
+@app.route("/max-webhook-last")
+def max_webhook_last():
+    event = load_max_webhook_event()
+    return jsonify(
+        {
+            "ok": True,
+            "event": event,
+        }
+    )
 
 
 @app.route("/check")
