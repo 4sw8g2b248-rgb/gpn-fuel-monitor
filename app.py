@@ -1132,7 +1132,7 @@ def max_test():
 
 @app.route("/max-unsubscribe")
 def max_unsubscribe():
-    webhook_url = request.host_url.rstrip("/") + "/max-webhook"
+    webhook_url = "https://" + request.host + "/max-webhook"
     response = max_delete_subscription(webhook_url)
     return jsonify(response), (200 if response.get("ok") else 400)
 
