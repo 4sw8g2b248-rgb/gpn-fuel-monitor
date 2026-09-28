@@ -643,7 +643,7 @@ def max_ssl_context():
     return ssl._create_unverified_context()
 
 
-def max_send_message(message):
+def max_send_message(message, chat_id=None):
     if not max_is_configured():
         return {
             "ok": False,
@@ -654,9 +654,18 @@ def max_send_message(message):
             ),
         }
 
+    target_chat_id = str(chat_id or MAX_CHAT_ID).strip()
+
+    if not target_chat_id:
+        return {
+            "ok": False,
+            "skipped": True,
+            "reason": "chat_id не задан",
+        }
+
     query = urllib.parse.urlencode(
         {
-            "chat_id": MAX_CHAT_ID,
+            "chat_id": target_chat_id,
         }
     )
 
@@ -1397,10 +1406,38 @@ def max_webhook():
         safe_event
     )
 
+    diagnostic = None
+    event_chat_id = payload.get("chat_id")
+    if event_chat_id:
+        diagnostic = max_send_message(
+            "✅ MAX-канал найден\n"
+            f"chat_id: {event_chat_id}\n"
+            f"Событие: {payload.get('update_type') or 'не указано'}",
+            chat_id=event_chat_id,
+        )
+
+    try:
+        print(
+            json.dumps(
+                {
+                    "max_webhook_event": safe_event,
+                    "diagnostic_send": diagnostic,
+                },
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
+    except Exception:
+        pass
+
     return jsonify(
         {
             "ok": True,
             "saved": saved,
+            "diagnostic_sent": bool(
+                isinstance(diagnostic, dict)
+                and diagnostic.get("ok")
+            ),
         }
     )
 
