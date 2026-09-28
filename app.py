@@ -927,6 +927,7 @@ def max_create_subscription(webhook_url):
                 "bot_added",
                 "bot_admin_permissions_changed",
                 "bot_removed",
+                "message_created",
             ],
         },
         ensure_ascii=False,
@@ -1407,14 +1408,66 @@ def max_webhook():
     )
 
     diagnostic = None
+
+    # Для bot_added / bot_admin_permissions_changed chat_id обычно
+    # приходит прямо в Update. Для message_created он находится
+    # внутри message.recipient.chat_id. Поддерживаем оба варианта.
     event_chat_id = payload.get("chat_id")
-    if event_chat_id:
-        diagnostic = max_send_message(
-            "✅ MAX-канал найден\n"
-            f"chat_id: {event_chat_id}\n"
-            f"Событие: {payload.get('update_type') or 'не указано'}",
-            chat_id=event_chat_id,
+
+    message = payload.get("message")
+    if not isinstance(message, dict):
+        message = {}
+
+    recipient = message.get("recipient")
+    if not isinstance(recipient, dict):
+        recipient = {}
+
+    if not event_chat_id:
+        event_chat_id = (
+            recipient.get("chat_id")
+            or recipient.get("chatId")
+            or message.get("chat_id")
+            or message.get("chatId")
         )
+
+    # Дополнительный запасной вариант на случай изменения формы Update.
+    if not event_chat_id:
+        top_recipient = payload.get("recipient")
+        if isinstance(top_recipient, dict):
+            event_chat_id = (
+                top_recipient.get("chat_id")
+                or top_recipient.get("chatId")
+            )
+
+    update_type = payload.get("update_type")
+
+    # Выводим найденный ID отдельной строкой, чтобы его было легко
+    # найти в логах Yandex Cloud по MAX_CHANNEL_ID_FOUND.
+    if event_chat_id:
+        try:
+            print(
+                f"MAX_CHANNEL_ID_FOUND={event_chat_id} "
+                f"UPDATE_TYPE={update_type or 'unknown'}",
+                flush=True,
+            )
+        except Exception:
+            pass
+
+        # Пробуем сразу подтвердить найденный канал сообщением.
+        # Защищаемся от возможного зацикливания, если MAX присылает
+        # message_created также на сообщения самого бота.
+        body = message.get("body")
+        if not isinstance(body, dict):
+            body = {}
+        incoming_text = str(body.get("text") or "")
+
+        if "MAX-канал найден" not in incoming_text:
+            diagnostic = max_send_message(
+                "✅ MAX-канал найден\n"
+                f"chat_id: {event_chat_id}\n"
+                f"Событие: {update_type or 'не указано'}",
+                chat_id=event_chat_id,
+            )
 
     try:
         print(
