@@ -739,6 +739,98 @@ def max_send_message(message):
         }
 
 
+
+def max_get_updates():
+    if not MAX_BOT_TOKEN:
+        return {
+            "ok": False,
+            "reason": "MAX_BOT_TOKEN не задан",
+        }
+
+    query = urllib.parse.urlencode(
+        {
+            "types": "bot_added,bot_admin_permissions_changed",
+            "timeout": 0,
+            "limit": 20,
+        }
+    )
+
+    url = MAX_API_BASE + "/updates?" + query
+
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": MAX_BOT_TOKEN,
+            "Accept": "application/json",
+            "User-Agent": "gpn-fuel-monitor/2.1",
+        },
+        method="GET",
+    )
+
+    try:
+        with urllib.request.urlopen(
+            req,
+            timeout=15,
+            context=max_ssl_context(),
+        ) as response:
+            raw = response.read().decode(
+                "utf-8",
+                errors="replace",
+            )
+            status_code = getattr(
+                response,
+                "status",
+                200,
+            )
+
+        data = json.loads(raw)
+        updates = data.get("updates") or []
+
+        safe_updates = []
+        for item in updates:
+            if not isinstance(item, dict):
+                continue
+
+            safe_updates.append(
+                {
+                    "update_type": item.get("update_type"),
+                    "timestamp": item.get("timestamp"),
+                    "chat_id": item.get("chat_id"),
+                    "is_channel": item.get("is_channel"),
+                }
+            )
+
+        return {
+            "ok": 200 <= status_code < 300,
+            "status_code": status_code,
+            "updates": safe_updates,
+            "marker": data.get("marker"),
+        }
+
+    except urllib.error.HTTPError as error:
+        try:
+            raw = error.read().decode(
+                "utf-8",
+                errors="replace",
+            )
+        except Exception:
+            raw = ""
+
+        return {
+            "ok": False,
+            "error": "HTTPError",
+            "status_code": error.code,
+            "message": str(error)[:500],
+            "response_body": raw[:1000],
+        }
+
+    except Exception as error:
+        return {
+            "ok": False,
+            "error": type(error).__name__,
+            "message": str(error)[:500],
+        }
+
 def load_max_state():
     try:
         with open(
@@ -1052,6 +1144,11 @@ def max_test():
             "max": response,
         }
     )
+
+
+@app.route("/max-updates")
+def max_updates():
+    return jsonify(max_get_updates())
 
 
 @app.route("/check")
