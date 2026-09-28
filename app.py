@@ -1354,7 +1354,8 @@ def max_subscriptions():
 @app.route("/max-subscribe")
 def max_subscribe():
     webhook_url = (
-        request.url_root.rstrip("/")
+        "https://"
+        + request.host
         + "/max-webhook"
     )
     return jsonify(
